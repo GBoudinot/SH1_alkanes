@@ -1,0 +1,254 @@
+---
+title: "20180606_alkanedata_SH1"
+output: html_document
+---
+
+# Start up functions
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r "load libraries", echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(stringr)
+library(knitr)
+library(readxl)
+library(tidyr)
+library(purrr)
+library(xlsx)
+library(gridExtra)
+opts_chunk$set(dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path = file.path("plots", "smoky_hollows_alkane")) ### CHANGE PLOT SUFFIX ###
+```
+
+# Read and organize data
+```{r}
+read_srm_export <- function(filename, columns = c("no", "peak_name", "RT.min", "area.cpm", "height.cts", "relativearea", "relativeheight", "amount")) {
+  filename %>% 
+    # read excel files
+    read_excel(sheet = "Integration", skip = 42, 
+               col_names = columns, col_types = rep("text", length(columns))) %>% 
+    as_data_frame() %>%
+    # remove empty rows
+    filter(!is.na(peak_name), peak_name != "n.a.") %>% 
+    # convert the relevant numeric columns into numbers
+    mutate_at(vars(RT.min, area.cpm, height.cts), as.numeric) %>% 
+    # remove useless columns
+    select(-no, -height.cts, -relativearea, -relativeheight, -amount) %>% 
+    # add filename info
+    mutate(file_id = gsub("\\.xls", "", basename(filename))) %>% 
+    select(file_id, everything())
+}
+
+# get data
+all_data <- 
+  # find all excel files ##change name and use new folder for new project
+  list.files( "data", recursive = TRUE, full.names = TRUE, pattern = "\\.xls$") %>% 
+  # send them to the read method
+  lapply(read_srm_export) %>% 
+  # combine the data set
+  bind_rows() %>% 
+  # pull out sample information
+  #mutate(sample_id = str_match(all_data$file_id, "TSQ\\d+_GB_(.*)$") %>% { .[,2] }) %>% 
+  # get n replicates
+  group_by(file_id)
+  #mutate(n_replicates = length(unique(file_id)))
+
+```
+
+```{r, echo=FALSE, eval=FALSE}
+# file names for metadata file
+all_data$file_id %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+
+# Calculation peak amounts and rock concentrations, ID standards
+```{r}
+depth_and_rock_info <- read_excel(file.path("metadata", "aliphaticalkane_SH1.xlsx")) %>% 
+  rename(tle = `TLE.mg`, maltene = `maltenes.mg`, ref_amount_added.ug = `3MeH.ug` )%>% 
+  filter(!is.na(file_id)) %>%
+  filter (process == "yes")
+depth_and_rock_info
+```
+
+
+```{r}
+data_by_depth <- 
+  all_data %>%
+  left_join(depth_and_rock_info, by = "file_id") %>% 
+  filter (process == "yes") %>%
+  group_by(file_id) %>% 
+  mutate(
+    n_peaks = n(),
+    n_standards = sum(peak_name == "3-methylheneicosane STD") , 
+    ref_area.cpm = area.cpm[peak_name == "3-methylheneicosane STD"],
+    amount.ug = area.cpm/ref_area.cpm * ref_amount_added.ug,
+   
+    #Normalize by what you want
+    conc_rock.ug_g = amount.ug / rock.g, 
+    conc_tle.ug.g = amount.ug / tle,  
+    conc_maltene.ug.g = amount.ug / maltene
+    
+  )%>% ungroup() %>% 
+  arrange(file_id, peak_name) 
+
+data_by_depth
+```
+
+
+# Combine compounds/make ratios
+
+
+```{r}
+# functions to make it easy to sum up peaks
+
+sum_peaks <- function(df, filter_condition, new_peak_name) {
+  filter_condition <- sprintf("(%s)", str_c(filter_condition, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_condition)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      conc_tle.ug.g = sum(conc_tle.ug.g)
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+
+ratio_peaks <- function(df, filter_top, filter_bottom, new_peak_name) {
+  filter_top <- sprintf("(%s)", str_c(filter_top, collapse = "|"))
+  filter_bottom <- sprintf("(%s)", str_c(filter_bottom, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_top) | str_detect(peak_name, filter_bottom)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      ratio = sum(conc_tle.ug.g[str_detect(peak_name, filter_top)]) / sum(conc_tle.ug.g[str_detect(peak_name, filter_bottom)])
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+
+norm_peaks <- function(df, filter_condition, x, new_peak_name) {
+  filter_condition <- sprintf("(%s)", str_c(filter_condition, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_condition)) %>% 
+  summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      conc_tle.ug.g = prod(conc_tle.ug.g) * x
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+
+```
+
+
+## Ratios, sums
+```{r}
+#set values to use for later calculations
+final_data1 <- data_by_depth %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+            #Conc_shortchain
+              sum_peaks(.,  c("C17", "C19", "C21"), "SCAng"),      
+            #Conc_longchain    
+              sum_peaks(., c("C27", "C29", "C31", "C33", "C35"), "LCAng"),
+            #CPI 
+              sum_peaks(., c("C25", "C27", "C29", "C31", "C33", "C27", "C29", "C31",  "C33", "C35"), "CPI_top"), 
+            
+              sum_peaks(., c("C26", "C28", "C30", "C32", "C34", "C26", "C28", "C30", "C32", "C34"), "CPI_bottom") ,
+            #ACL
+              norm_peaks(., "C17" , 17, "C17n"),
+              norm_peaks(., "C19" , 19, "C19n"),
+              norm_peaks(., "C21" , 21, "C21n"),
+              norm_peaks(., "C23" , 23, "C23n"),
+              norm_peaks(., "C25" , 25, "C25n"),
+              norm_peaks(., "C27" , 27, "C27n"),
+              norm_peaks(., "C29" , 29, "C29n"),
+              norm_peaks(., "C31" , 31, "C31n"),
+              norm_peaks(., "C33" , 33, "C33n"),
+              norm_peaks(., "C35" , 35, "C35n")
+) }) %>% ungroup()
+
+```
+
+```{r}
+#set values to use for later calculations
+final_data2 <- final_data1 %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+            #ACL-short-top
+              sum_peaks(., c("C17n", "C19n", "C21n"), "ACL_short_top"), 
+            #ACL-long-top
+              sum_peaks(., c("C27n", "C29n", "C31n", "C33n", "C35n"), "ACL_long_top"), 
+            #ACL-all-top
+              sum_peaks(., c("C17n", "C19n", "C21n", "C23n", "C25n", "C27n", "C29n", "C31n", "C33n", "C35n"), "ACL_all_top")
+) }) %>% ungroup()
+
+```
+
+## Ratios, sums
+```{r}
+#set values to use for later calculations
+final_data <- final_data2 %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+            #CPI
+              ratio_peaks(., "CPI_top", "CPI_bottom", "CPI"),
+            #ACL-short
+              ratio_peaks(., "ACL_short_top", c("C17", "C19", "C21"), "ACL_short"), 
+            #ACL-long
+              ratio_peaks(., "ACL_long_top", c("C27", "C29", "C31", "C33", "C35"), "ACL_long"), 
+            #ACL-all
+              ratio_peaks(., "ACL_all_top", c("C17", "C19", "C21", "C23", "C25", "C27", "C29", "C31", "C33", "C35"), "ACL_all"), 
+            #Pr/Ph
+              ratio_peaks(., "Pr", "Ph", "Pr/Ph"),
+            #Conc_Pr+Ph
+              sum_peaks(., c( "Pr", "Ph"), "PrPh_ng"),
+            #SCA/LCA
+              ratio_peaks(., "SCAng", "LCAng", "SCA/LCA"),
+            #LCA/LCA+SCA
+              ratio_peaks(., "LCAng", "SCAng", "LCA/LCA+SCA")
+) }) %>% ungroup()
+
+```
+
+```{r}
+xport <- final_data %>% select(file_id, depth, peak_name, ratio, amount.ug, conc_rock.ug_g, conc_tle.ug.g, conc_maltene.ug.g)
+write.csv(xport, file = "SH1_nalk.csv")
+```
+
+
+#Plots
+
+```{r "", fig.width = 20, fig.height = 5}
+subset(final_data, peak_name %in% c("CPI", "Pr/Ph", "LCA/LCA+SCA", "ACL_long", "ACL_all", "ACL_short")) %>%
+  ggplot() +
+  #geom_area(mapping = aes(fill = var)) +
+  aes(x = depth, y = ratio, color = peak_name) +
+  geom_point()+
+  geom_line()+
+  facet_grid(~peak_name, scales = "free") +
+  coord_flip() +
+  scale_x_reverse() +
+  scale_y_continuous() 
+
+```
+
+
+```{r "", fig.width = 20, fig.height = 5}
+subset(final_data, peak_name %in% c( "SCAng", "LCAng")) %>%
+  ggplot() +
+  #geom_area(mapping = aes(fill = var)) +
+  aes(x = depth, y = conc_tle.ug.g, color = peak_name) +
+  geom_point()+
+  geom_line()+
+  facet_grid(~peak_name, scales = "free") +
+  coord_flip() +
+  scale_x_reverse() +
+  scale_y_continuous() 
+
+```
